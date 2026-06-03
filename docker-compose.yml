@@ -20,6 +20,8 @@ services:
       - db
     environment:
       DATABASE_URL: postgresql://icestats:icestats@db:5432/icestats
+    volumes:
+      - .:/app
 
 volumes:
   postgres_data:

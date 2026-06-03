@@ -1,9 +1,19 @@
 import os
+import base64
 import streamlit as st
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 from sqlalchemy import create_engine, text
+
+def _logo_b64() -> str:
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logo.png")
+    if not os.path.exists(path):
+        return ""
+    with open(path, "rb") as f:
+        return base64.b64encode(f.read()).decode()
+
+_LOGO = _logo_b64()
 
 st.set_page_config(page_title="IceStats", layout="wide", initial_sidebar_state="collapsed")
 
@@ -56,6 +66,8 @@ h1, h2, h3 {
     gap: 8px !important;
     backdrop-filter: blur(20px) saturate(1.5);
     box-shadow: 0 4px 32px rgba(0,0,0,0.5), inset 0 1px 0 rgba(79,195,247,0.08);
+    width: fit-content !important;
+    margin: 0 auto !important;
 }
 
 .stTabs [data-baseweb="tab"] {
@@ -170,6 +182,52 @@ hr {
 }
 .element-container { animation: fadeInUp 0.45s ease forwards; }
 
+/* DB sync indicator */
+.db-sync {
+    text-align: right;
+    flex-shrink: 0;
+}
+.db-sync-status {
+    font-family: 'Exo 2', sans-serif;
+    font-size: 0.72rem;
+    font-weight: 600;
+    letter-spacing: 2px;
+    text-transform: uppercase;
+    color: #66bb6a;
+    display: flex;
+    align-items: center;
+    justify-content: flex-end;
+    gap: 7px;
+}
+.db-dot {
+    display: inline-block;
+    width: 7px;
+    height: 7px;
+    border-radius: 50%;
+    background: #66bb6a;
+    box-shadow: 0 0 8px #66bb6a;
+    animation: pulse-dot 2.5s ease-in-out infinite;
+    flex-shrink: 0;
+}
+@keyframes pulse-dot {
+    0%,100% { opacity:1; box-shadow:0 0 8px #66bb6a; }
+    50%      { opacity:0.55; box-shadow:0 0 16px #66bb6a, 0 0 4px #66bb6a; }
+}
+.db-sync-file {
+    font-family: 'Exo 2', sans-serif;
+    font-size: 0.68rem;
+    color: rgba(79,195,247,0.65);
+    margin-top: 5px;
+    letter-spacing: 0.5px;
+}
+.db-sync-meta {
+    font-family: 'Exo 2', sans-serif;
+    font-size: 0.62rem;
+    color: rgba(79,195,247,0.38);
+    margin-top: 3px;
+    letter-spacing: 0.5px;
+}
+
 /* Caption */
 .stCaption {
     font-family: 'Exo 2', sans-serif !important;
@@ -256,6 +314,22 @@ hr {
 
 /* Spinner */
 .stSpinner > div { border-top-color: #4fc3f7 !important; }
+
+/* Footer de estado de BD */
+.db-footer {
+    position: fixed;
+    bottom: 0;
+    left: 0;
+    right: 0;
+    background: rgba(6,0,26,0.92);
+    border-top: 1px solid rgba(79,195,247,0.18);
+    padding: 8px 28px;
+    display: flex;
+    align-items: center;
+    gap: 20px;
+    backdrop-filter: blur(16px);
+    z-index: 9999;
+}
 </style>
 """, unsafe_allow_html=True)
 
@@ -308,6 +382,31 @@ def run_query(_engine, sql, params=None):
 
 engine = get_engine()
 
+if "pipeline_checked" not in st.session_state:
+    try:
+        with engine.connect() as conn:
+            count = conn.execute(text("SELECT COUNT(*) FROM shots")).scalar()
+    except Exception:
+        count = 0
+
+    if count == 0:
+        _, _mid, _ = st.columns([1, 1, 1])
+        with _mid:
+            if _LOGO:
+                st.markdown(f'<img src="data:image/png;base64,{_LOGO}" style="width:100%;filter:drop-shadow(0 0 24px rgba(79,195,247,0.5));">', unsafe_allow_html=True)
+        st.markdown("<p style='text-align:center;font-family:Orbitron,monospace;color:#4fc3f7;letter-spacing:3px;font-size:0.8rem;margin-top:16px;'>INICIALIZANDO BASE DE DATOS</p>", unsafe_allow_html=True)
+        with st.spinner("Esto puede tardar unos minutos..."):
+            import sys
+            sys.path.insert(0, "/app")
+            from pipeline.extract import extract_all
+            from pipeline.transform import transform_all
+            from pipeline.load import load_all
+            raw = extract_all()
+            transformed = transform_all(raw)
+            load_all(transformed)
+
+    st.session_state["pipeline_checked"] = True
+
 @st.cache_data(ttl=3600)
 def load_globals(_engine):
     teams = run_query(_engine,
@@ -319,6 +418,26 @@ def load_globals(_engine):
     return teams, seasons
 
 teams, seasons = load_globals(engine)
+
+@st.cache_data(ttl=3600)
+def load_db_stats(_engine):
+    from datetime import date
+    import sys as _sys
+    _sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+    try:
+        from pipeline.extract import FILES as _FILES
+        shot_files = " · ".join([_FILES["shots_historical"], _FILES["shots_2022"]])
+    except Exception:
+        shot_files = "shots_2007-2021.csv · shots_2022.csv"
+    with _engine.connect() as conn:
+        count = conn.execute(text("SELECT COUNT(*) FROM shots")).scalar()
+    meses = ["ene","feb","mar","abr","may","jun","jul","ago","sep","oct","nov","dic"]
+    hoy = date.today()
+    date_str = f"{hoy.day} {meses[hoy.month-1]} {hoy.year}"
+    return int(count or 0), shot_files, date_str
+
+_db_count, _db_files, _db_date = load_db_stats(engine)
+_db_count_fmt = f"{_db_count:,}".replace(",", ".")
 
 # ── Mapa de cancha ────────────────────────────────────────────────────────────
 def shot_map(df, title=""):
@@ -402,10 +521,13 @@ def shot_map(df, title=""):
     return fig
 
 # ── Banner ─────────────────────────────────────────────────────────────────────
-st.markdown("""
+_logo_tag = f'<img src="data:image/png;base64,{_LOGO}" style="height:80px;width:auto;filter:drop-shadow(0 0 18px rgba(79,195,247,0.55));flex-shrink:0;">' if _LOGO else ""
+st.markdown(f"""
 <div class="banner">
-  <div class="banner-title">ICESTATS</div>
-  <div class="banner-sub">NHL Advanced Analytics Platform &nbsp;&mdash;&nbsp; Grupo 03 &nbsp;&mdash;&nbsp; UNLP 2024</div>
+  <div style="display:flex;align-items:center;justify-content:center;gap:24px;position:relative;z-index:1;">
+    {_logo_tag}
+    <div class="banner-title">IceStats</div>
+  </div>
 </div>
 """, unsafe_allow_html=True)
 
@@ -681,3 +803,12 @@ with tab_rec:
         base_layout(fig_goalie, "Goals Saved Above Expected")
         fig_goalie.update_layout(xaxis_tickangle=45)
         st.plotly_chart(fig_goalie, use_container_width=True)
+
+# ── Footer ────────────────────────────────────────────────────────────────────
+st.markdown(f"""
+<div class="db-footer">
+  <div class="db-sync-status"><span class="db-dot"></span>Base sincronizada</div>
+  <div class="db-sync-file">{_db_files}</div>
+  <div class="db-sync-meta">{_db_count_fmt} registros &nbsp;&middot;&nbsp; {_db_date}</div>
+</div>
+""", unsafe_allow_html=True)
