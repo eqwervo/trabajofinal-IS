@@ -315,20 +315,41 @@ hr {
 /* Spinner */
 .stSpinner > div { border-top-color: #4fc3f7 !important; }
 
+
+/* File uploader — fix doubled text and style */
+[data-testid="stFileUploader"] label { font-size: 0.82rem; color: rgba(79,195,247,0.7); }
+[data-testid="stFileUploaderDropzone"] {
+    background: rgba(13,13,43,0.6) !important;
+    border: 1px dashed rgba(79,195,247,0.35) !important;
+    border-radius: 8px !important;
+    padding: 10px 14px !important;
+}
+[data-testid="stFileUploaderDropzone"] > div { gap: 6px !important; }
+[data-testid="stFileUploaderDropzone"] button {
+    background: rgba(79,195,247,0.12) !important;
+    border: 1px solid rgba(79,195,247,0.4) !important;
+    color: #4fc3f7 !important;
+    border-radius: 6px !important;
+    padding: 4px 14px !important;
+    font-size: 0.78rem !important;
+}
+[data-testid="stFileUploaderDropzone"] button span { display: none !important; }
+[data-testid="stFileUploaderDropzone"] button::after { content: "Upload"; }
+[data-testid="stFileUploaderDropzone"] > div > span {
+    font-size: 0.74rem !important;
+    color: rgba(230,237,243,0.45) !important;
+}
+
 /* Footer de estado de BD */
 .db-footer {
-    position: fixed;
-    bottom: 0;
-    left: 0;
-    right: 0;
     background: rgba(6,0,26,0.92);
     border-top: 1px solid rgba(79,195,247,0.18);
+    border-radius: 10px;
     padding: 8px 28px;
     display: flex;
     align-items: center;
     gap: 20px;
-    backdrop-filter: blur(16px);
-    z-index: 9999;
+    margin-top: 32px;
 }
 </style>
 """, unsafe_allow_html=True)
@@ -390,22 +411,77 @@ if "pipeline_checked" not in st.session_state:
         count = 0
 
     if count == 0:
+        import sys, os as _os
+        sys.path.insert(0, "/app")
+        from pipeline.extract import extract_all, FILES, RAW_DATA_DIR
+        from pipeline.transform import transform_all
+        from pipeline.load import load_all
+
+        # Verificar si los archivos CSV están disponibles en data/raw/
+        files_exist = all(
+            _os.path.exists(_os.path.join(RAW_DATA_DIR, f)) for f in FILES.values()
+        )
+
         _, _mid, _ = st.columns([1, 1, 1])
         with _mid:
             if _LOGO:
                 st.markdown(f'<img src="data:image/png;base64,{_LOGO}" style="width:100%;filter:drop-shadow(0 0 24px rgba(79,195,247,0.5));">', unsafe_allow_html=True)
-        st.markdown("<p style='text-align:center;font-family:Orbitron,monospace;color:#4fc3f7;letter-spacing:3px;font-size:0.8rem;margin-top:16px;'>INICIALIZANDO BASE DE DATOS</p>", unsafe_allow_html=True)
-        with st.spinner("Esto puede tardar unos minutos..."):
-            import sys
-            sys.path.insert(0, "/app")
-            from pipeline.extract import extract_all
-            from pipeline.transform import transform_all
-            from pipeline.load import load_all
-            raw = extract_all()
-            transformed = transform_all(raw)
-            load_all(transformed)
 
-    st.session_state["pipeline_checked"] = True
+        if files_exist:
+            # Modo local: archivos presentes en data/raw/
+            # Usa streaming para shots (evita OOM con ~1.7M filas)
+            st.markdown("<p style='text-align:center;font-family:Orbitron,monospace;color:#4fc3f7;letter-spacing:3px;font-size:0.8rem;margin-top:16px;'>INICIALIZANDO BASE DE DATOS</p>", unsafe_allow_html=True)
+            with st.spinner("Esto puede tardar unos minutos..."):
+                from pipeline.extract import extract_teams, extract_players
+                from pipeline.transform import transform_teams, transform_players
+                from pipeline.load import load_shots_streaming, load_teams, load_players, get_engine as _get_engine, create_tables
+                _eng = _get_engine()
+                create_tables(_eng)
+                load_shots_streaming(_eng)          # lee CSV en chunks, no carga todo a RAM
+                load_teams(transform_teams(extract_teams()), _eng)
+                load_players(transform_players(extract_players()), _eng)
+            st.session_state["pipeline_checked"] = True
+            st.rerun()
+        else:
+            # Modo upload: archivos no encontrados, pedir al usuario
+            st.markdown("<p style='text-align:center;font-family:Orbitron,monospace;color:#4fc3f7;letter-spacing:3px;font-size:0.8rem;margin-top:16px;'>CARGA DE ARCHIVOS REQUERIDA</p>", unsafe_allow_html=True)
+            st.markdown("<p style='text-align:center;font-family:Exo 2,sans-serif;color:rgba(79,195,247,0.6);font-size:0.8rem;'>No se encontraron los archivos CSV en data/raw/. Subí los 4 archivos para inicializar la base de datos.</p>", unsafe_allow_html=True)
+            st.divider()
+            col_u1, col_u2 = st.columns(2)
+            with col_u1:
+                uf_hist    = st.file_uploader("shots_2007-2021.csv", type="csv", key="init_hist")
+                uf_teams   = st.file_uploader("all_teams.csv",        type="csv", key="init_teams")
+            with col_u2:
+                uf_2022    = st.file_uploader("shots_2022.csv",       type="csv", key="init_2022")
+                uf_players = st.file_uploader("allPlayersLookup.csv", type="csv", key="init_players")
+
+            all_uploaded = all([uf_hist, uf_2022, uf_teams, uf_players])
+            if all_uploaded:
+                if st.button("Inicializar base de datos", type="primary"):
+                    with st.spinner("Guardando archivos..."):
+                        _os.makedirs(RAW_DATA_DIR, exist_ok=True)
+                        for _fname, _fobj in [
+                            (FILES["shots_historical"], uf_hist),
+                            (FILES["shots_2022"],       uf_2022),
+                            (FILES["teams"],            uf_teams),
+                            (FILES["players"],          uf_players),
+                        ]:
+                            with open(_os.path.join(RAW_DATA_DIR, _fname), "wb") as _f:
+                                _f.write(_fobj.read())
+                    with st.spinner("Procesando y cargando base de datos..."):
+                        from pipeline.extract import extract_teams, extract_players
+                        from pipeline.transform import transform_teams, transform_players
+                        from pipeline.load import load_shots_streaming, load_teams, load_players, get_engine as _get_engine, create_tables
+                        _eng = _get_engine()
+                        create_tables(_eng)
+                        load_shots_streaming(_eng)
+                        load_teams(transform_teams(extract_teams()), _eng)
+                        load_players(transform_players(extract_players()), _eng)
+                    st.session_state["pipeline_checked"] = True
+                    st.rerun()
+            else:
+                st.caption("Subí los 4 archivos para habilitar la carga.")
+            st.stop()
 
 @st.cache_data(ttl=3600)
 def load_globals(_engine):
@@ -538,7 +614,7 @@ tab_dir, tab_ent, tab_rec = st.tabs(["DIRECTIVOS", "ENTRENADOR", "RECLUTADOR"])
 # ═══════════════════════════════════════════════════════════════════════════════
 with tab_dir:
     sh("Filtros de análisis")
-    col1, col2, col3 = st.columns([1, 2, 1])
+    col1, col2, col3, col4 = st.columns([1, 2, 1, 1])
     with col1:
         idx = teams.index("TOR") if "TOR" in teams else 0
         team_d = st.selectbox("Franquicia", teams, index=idx, key="team_d")
@@ -547,8 +623,11 @@ with tab_dir:
                                         value=(seasons[0], seasons[-1]), key="seasons_d")
     with col3:
         game_type = st.selectbox("Tipo de partido", ["Todos","Regular","Playoffs"], key="gt_d")
+    with col4:
+        sit_d = st.selectbox("Situación (ranking)", ["Todas","5v5","PP","PK","EN"], key="sit_d")
 
     pc = {"Todos":"","Regular":'AND "isPlayoffGame"=0',"Playoffs":'AND "isPlayoffGame"=1'}[game_type]
+    sit_d_cond = "" if sit_d == "Todas" else f'AND "gameSituation"=\'{sit_d}\''
     s1, s2 = int(season_range[0]), int(season_range[1])
 
     with st.spinner("Cargando datos históricos..."):
@@ -579,7 +658,19 @@ with tab_dir:
     m4.metric("xGF% promedio",      f"{df_hist['xGF%'].mean():.1f}%")
 
     st.divider()
-    sh("Evolución xGoal% por temporada")
+    sh("Evolución xGoal%, Corsi% y Fenwick% por temporada")
+    pc_teams = {"Todos": "", "Regular": 'AND "playoffGame"=0', "Playoffs": 'AND "playoffGame"=1'}[game_type]
+    with st.spinner("Cargando métricas de posesión..."):
+        df_corsi = run_query(engine, f"""
+            SELECT season,
+                   ROUND(AVG("corsiPercentage")::numeric * 100, 1) AS corsi_pct,
+                   ROUND(AVG("fenwickPercentage")::numeric * 100, 1) AS fenwick_pct
+            FROM teams
+            WHERE team=:t AND season BETWEEN :s1 AND :s2
+              AND situation='all' {pc_teams}
+            GROUP BY season ORDER BY season
+        """, {"t": team_d, "s1": s1, "s2": s2})
+
     fig_hist = go.Figure()
     fig_hist.add_trace(go.Scatter(
         x=df_hist["season"], y=df_hist["xGF%"], mode="lines+markers", name="xGF%",
@@ -588,11 +679,29 @@ with tab_dir:
         fill="tozeroy", fillcolor="rgba(79,195,247,0.05)",
         hovertemplate="<b>%{x}</b><br>xGF%%: %{y:.1f}<extra></extra>",
     ))
+    fig_hist.add_trace(go.Scatter(
+        x=df_corsi["season"], y=df_corsi["corsi_pct"], mode="lines+markers", name="Corsi%",
+        line=dict(color=C_PURP, width=2.5),
+        marker=dict(size=8, color=C_PURP, line=dict(width=2, color=C_CYAN)),
+        hovertemplate="<b>%{x}</b><br>Corsi%%: %{y:.1f}<extra></extra>",
+    ))
+    fig_hist.add_trace(go.Scatter(
+        x=df_corsi["season"], y=df_corsi["fenwick_pct"], mode="lines+markers", name="Fenwick%",
+        line=dict(color=C_GRN, width=2, dash="dot"),
+        marker=dict(size=7, color=C_GRN),
+        hovertemplate="<b>%{x}</b><br>Fenwick%%: %{y:.1f}<extra></extra>",
+    ))
     fig_hist.add_hline(y=50, line_dash="dash", line_color=C_RED, line_width=1,
                        annotation_text="50% — equilibrio",
                        annotation_font=dict(color=C_RED, family=FONT_H, size=9))
     base_layout(fig_hist)
-    fig_hist.update_layout(yaxis=dict(range=[30,70]), xaxis_title="Temporada", yaxis_title="xGoal%")
+    fig_hist.update_layout(
+        yaxis=dict(range=[30, 70]),
+        xaxis_title="Temporada",
+        yaxis_title="Porcentaje",
+        legend=dict(font=dict(family=FONT_B, size=11, color="#c9d1d9"),
+                    bgcolor="rgba(0,0,0,0)", bordercolor="rgba(79,195,247,0.2)", borderwidth=1),
+    )
     st.plotly_chart(fig_hist, use_container_width=True)
 
     st.divider()
@@ -601,7 +710,7 @@ with tab_dir:
         df_liga = run_query(engine, f"""
             SELECT CASE WHEN "isHomeTeam"=1 THEN "homeTeamCode" ELSE "awayTeamCode" END AS team,
                    SUM("xGoal") AS xgf, SUM("goal") AS goals, COUNT(*) AS shots
-            FROM shots WHERE season=:season {pc}
+            FROM shots WHERE season=:season {pc} {sit_d_cond}
             GROUP BY 1 ORDER BY xgf DESC
         """, {"season": s2})
 
@@ -613,6 +722,63 @@ with tab_dir:
     base_layout(fig_liga, "xGoals For por equipo")
     fig_liga.update_layout(xaxis_tickangle=45)
     st.plotly_chart(fig_liga, use_container_width=True)
+
+    st.divider()
+    sh("Racha de resultados partido a partido")
+    season_wl = int(st.selectbox("Temporada", seasons[::-1], key="season_wl"))
+    with st.spinner("Cargando resultados partido a partido..."):
+        df_wl = run_query(engine, f"""
+            SELECT "gameDate", "goalsFor", "goalsAgainst", "home_or_away", "opposingTeam"
+            FROM teams
+            WHERE team=:t AND season=:season
+              AND situation='all' {pc_teams}
+            ORDER BY "gameDate"
+        """, {"t": team_d, "season": season_wl})
+
+    if not df_wl.empty:
+        df_wl["result"]   = (df_wl["goalsFor"] > df_wl["goalsAgainst"]).map({True: "W", False: "L"})
+        df_wl["color"]    = df_wl["result"].map({"W": C_GRN, "L": C_RED})
+        df_wl["game_num"] = range(1, len(df_wl) + 1)
+        df_wl["label"]    = df_wl.apply(
+            lambda r: f"Partido {int(r['game_num'])}  |  {'LOCAL' if r['home_or_away']=='HOME' else 'VISITANTE'} vs {r['opposingTeam']}<br>"
+                      f"Resultado: {int(r['goalsFor'])}–{int(r['goalsAgainst'])}  {'✓ W' if r['result']=='W' else '✗ L'}",
+            axis=1
+        )
+
+        fig_wl = go.Figure(go.Scatter(
+            x=df_wl["game_num"],
+            y=[0] * len(df_wl),
+            mode="markers",
+            marker=dict(
+                symbol="square",
+                size=16,
+                color=df_wl["color"],
+                line=dict(width=0),
+            ),
+            text=df_wl["label"],
+            hoverinfo="text",
+            showlegend=False,
+        ))
+        # Leyenda manual
+        for label, color in [("Victoria", C_GRN), ("Derrota", C_RED)]:
+            fig_wl.add_trace(go.Scatter(
+                x=[None], y=[None], mode="markers",
+                marker=dict(symbol="square", size=12, color=color),
+                name=label, showlegend=True,
+            ))
+
+        base_layout(fig_wl, f"{team_d}  |  Temporada {season_wl}")
+        fig_wl.update_layout(
+            height=160,
+            yaxis=dict(visible=False, range=[-1, 1]),
+            xaxis=dict(title="N° de partido", gridcolor="rgba(0,0,0,0)"),
+            legend=dict(font=dict(family=FONT_B, size=11, color="#c9d1d9"),
+                        bgcolor="rgba(0,0,0,0)", orientation="h", x=0.01, y=1.3),
+            margin=dict(l=16, r=16, t=40, b=40),
+        )
+        st.plotly_chart(fig_wl, use_container_width=True)
+    else:
+        st.caption("Sin datos de partidos para la temporada seleccionada.")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -703,11 +869,13 @@ with tab_ent:
         FROM shots WHERE {home_cond} AND season=:season {sit_cond}
     """, {"t": team_e, "season": season_e})
     r = df_rush.iloc[0]
+    def _si(v): return int(v) if pd.notna(v) else 0
+    def _sf(v): return float(v) if pd.notna(v) else 0.0
     c1,c2,c3,c4 = st.columns(4)
-    c1.metric("Tiros en rush",  f"{int(r['rn']):,}",  delta=f"{int(r['rg'])} goles")
-    c2.metric("xGoal en rush",  f"{r['rxg']:.1f}")
-    c3.metric("Tiros normales", f"{int(r['nn']):,}", delta=f"{int(r['ng'])} goles")
-    c4.metric("xGoal normales", f"{r['nxg']:.1f}")
+    c1.metric("Tiros en rush",  f"{_si(r['rn']):,}",  delta=f"{_si(r['rg'])} goles")
+    c2.metric("xGoal en rush",  f"{_sf(r['rxg']):.1f}")
+    c3.metric("Tiros normales", f"{_si(r['nn']):,}", delta=f"{_si(r['ng'])} goles")
+    c4.metric("xGoal normales", f"{_sf(r['nxg']):.1f}")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -726,31 +894,57 @@ with tab_rec:
     sh("Ranking ofensivo — Top jugadores")
     with st.spinner("Calculando métricas avanzadas..."):
         df_rank = run_query(engine, f"""
-            SELECT "shooterName" AS jugador, "playerPositionThatDidEvent" AS pos,
-                   COUNT(*) AS disparos, SUM("goal") AS goles,
-                   ROUND(SUM("xGoal")::numeric,2) AS xgoal,
-                   ROUND(SUM("goal")::numeric/NULLIF(COUNT(*),0)*100,1) AS conv_pct,
-                   ROUND((SUM("goal")-SUM("xGoal"))::numeric,2) AS goe
-            FROM shots
-            WHERE season=:season AND "shooterName" IS NOT NULL {pos_cond}
+            SELECT s."shooterName" AS jugador, s."playerPositionThatDidEvent" AS pos,
+                   COUNT(*) AS disparos, SUM(s."goal") AS goles,
+                   ROUND(SUM(s."xGoal")::numeric,2) AS xgoal,
+                   ROUND(SUM(s."goal")::numeric/NULLIF(COUNT(*),0)*100,1) AS conv_pct,
+                   ROUND((SUM(s."goal")-SUM(s."xGoal"))::numeric,2) AS goe,
+                   MAX(p.nationality) AS nacionalidad,
+                   MAX(p."birthDate") AS birth_date,
+                   MAX(p.weight) AS peso,
+                   MAX(p.height) AS altura
+            FROM shots s
+            LEFT JOIN players p ON s."shooterPlayerId" = p."playerId"
+            WHERE s.season=:season AND s."shooterName" IS NOT NULL {pos_cond}
             GROUP BY 1,2 HAVING COUNT(*)>=:ms
             ORDER BY xgoal DESC LIMIT 30
         """, {"season": season_r, "ms": min_shots})
 
-    col_r1, col_r2 = st.columns([1,1])
-    with col_r1:
-        st.dataframe(df_rank, use_container_width=True, hide_index=True)
-    with col_r2:
-        fig_rank = go.Figure(go.Bar(
-            x=df_rank.head(15)["jugador"], y=df_rank.head(15)["xgoal"],
-            marker=dict(color=df_rank.head(15)["goles"],
-                        colorscale=[[0,C_CYAN],[0.5,C_PURP],[1,C_RED]],
-                        line=dict(color="rgba(79,195,247,0.15)",width=0.5)),
-            hovertemplate="<b>%{x}</b><br>xGoal: %{y:.2f}<extra></extra>",
-        ))
-        base_layout(fig_rank, "Top 15 — xGoal acumulado")
-        fig_rank.update_layout(xaxis_tickangle=45)
-        st.plotly_chart(fig_rank, use_container_width=True)
+    # Calcular edad a partir del año de nacimiento y la temporada seleccionada
+    df_rank["edad"] = df_rank["birth_date"].apply(
+        lambda d: season_r - int(str(d)[:4]) if pd.notna(d) and str(d) not in ("nan", "None", "") else None
+    )
+
+    # Construir tabla de display con columnas renombradas y "No Data" en celdas vacías
+    df_display = df_rank[["jugador","pos","nacionalidad","edad","peso","altura",
+                           "disparos","goles","xgoal","conv_pct","goe"]].copy()
+    df_display = df_display.rename(columns={
+        "jugador":    "Jugador",
+        "pos":        "Pos",
+        "nacionalidad":"Nac.",
+        "edad":       "Edad",
+        "peso":       "Peso (lb)",
+        "altura":     "Altura",
+        "disparos":   "Disparos",
+        "goles":      "Goles",
+        "xgoal":      "xGoal",
+        "conv_pct":   "Conv%",
+        "goe":        "GOE",
+    })
+    df_display = df_display.fillna("No Data")
+
+    st.dataframe(df_display, use_container_width=True, hide_index=True)
+
+    fig_rank = go.Figure(go.Bar(
+        x=df_rank.head(15)["jugador"], y=df_rank.head(15)["xgoal"],
+        marker=dict(color=df_rank.head(15)["goles"],
+                    colorscale=[[0,C_CYAN],[0.5,C_PURP],[1,C_RED]],
+                    line=dict(color="rgba(79,195,247,0.15)",width=0.5)),
+        hovertemplate="<b>%{x}</b><br>xGoal: %{y:.2f}<extra></extra>",
+    ))
+    base_layout(fig_rank, "Top 15 — xGoal acumulado")
+    fig_rank.update_layout(xaxis_tickangle=45)
+    st.plotly_chart(fig_rank, use_container_width=True)
 
     st.divider()
     col_c1, col_c2 = st.columns(2)
@@ -803,6 +997,42 @@ with tab_rec:
         base_layout(fig_goalie, "Goals Saved Above Expected")
         fig_goalie.update_layout(xaxis_tickangle=45)
         st.plotly_chart(fig_goalie, use_container_width=True)
+
+# ── Actualizar dataset ───────────────────────────────────────────────────────
+with st.expander("Actualizar shots", expanded=False):
+    st.markdown("<p style='text-align:center;font-family:Orbitron,monospace;font-size:0.75rem;letter-spacing:3px;text-transform:uppercase;color:#4fc3f7;margin-bottom:6px;'>Reemplazar archivos de tiros</p>", unsafe_allow_html=True)
+    st.markdown("<p style='text-align:center;font-family:Exo 2,sans-serif;font-size:0.78rem;color:rgba(79,195,247,0.55);margin-bottom:16px;'>Subí los archivos de shots para actualizar los datos. Equipos y jugadores se mantienen.</p>", unsafe_allow_html=True)
+    uc1, uc2 = st.columns(2)
+    with uc1:
+        up_hist = st.file_uploader("shots_2007-2021.csv", type="csv", key="up_hist")
+    with uc2:
+        up_2022 = st.file_uploader("shots_2022.csv", type="csv", key="up_2022")
+
+    all_uploaded = all([up_hist, up_2022])
+    if st.button("Procesar y actualizar", disabled=not all_uploaded, key="btn_update"):
+        try:
+            import sys as _sys2, os as _os2
+            _sys2.path.insert(0, "/app")
+            from pipeline.extract import FILES as _FILES, RAW_DATA_DIR as _RAW
+            from pipeline.load import load_shots_streaming as _load_shots, get_engine as _get_eng, create_tables as _create_tables
+            with st.spinner("Guardando archivos..."):
+                _os2.makedirs(_RAW, exist_ok=True)
+                for _fname, _fobj in [
+                    (_FILES["shots_historical"], up_hist),
+                    (_FILES["shots_2022"],       up_2022),
+                ]:
+                    with open(_os2.path.join(_RAW, _fname), "wb") as _f:
+                        _f.write(_fobj.read())
+            with st.spinner("Procesando shots..."):
+                _eng2 = _get_eng()
+                _create_tables(_eng2)
+                _load_shots(_eng2)
+            st.cache_data.clear()
+            st.session_state.pop("pipeline_checked", None)
+            st.success("Shots actualizados. Recargando...")
+            st.rerun()
+        except Exception as e:
+            st.error(f"Error al actualizar: {e}")
 
 # ── Footer ────────────────────────────────────────────────────────────────────
 st.markdown(f"""

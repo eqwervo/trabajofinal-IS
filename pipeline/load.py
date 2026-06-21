@@ -41,7 +41,7 @@ logger = logging.getLogger(__name__)
 # Con ~1.7M filas, cargar todo de una vez consumiría demasiada memoria.
 # Dividimos la carga en bloques de CHUNK_SIZE filas.
 # Valor elegido como balance entre velocidad y uso de memoria.
-CHUNK_SIZE = 50_000
+CHUNK_SIZE = 20_000
 
 
 # ── Conexión ──────────────────────────────────────────────────────────────────
@@ -93,8 +93,12 @@ def get_engine():
 
 SHOTS_DDL = """
 CREATE TABLE IF NOT EXISTS shots (
-    -- Identificadores únicos
-    "shotID"               INTEGER PRIMARY KEY,
+    -- PK surrogate: auto-incremental, Postgres la genera sola en cada INSERT/COPY
+    -- No va en el DataFrame → el COPY la ignora y la secuencia la rellena
+    "id"                   BIGSERIAL PRIMARY KEY,
+
+    -- Identificadores del tiro (no únicos por sí solos entre temporadas)
+    "shotID"               INTEGER,
     "season"               SMALLINT,
     "isPlayoffGame"        SMALLINT,
     "game_id"              INTEGER,
@@ -155,44 +159,56 @@ CREATE TABLE IF NOT EXISTS shots (
 );
 """
 
-TEAMS_DDL = """
-CREATE TABLE IF NOT EXISTS teams (
-    -- Clave compuesta: un equipo puede aparecer en múltiples temporadas y situaciones
-    "season"       SMALLINT,
-    "team"         VARCHAR(10),
-    "situation"    VARCHAR(20),
-    PRIMARY KEY ("season", "team", "situation")
-);
-"""
-
-PLAYERS_DDL = """
-CREATE TABLE IF NOT EXISTS players (
-    "playerId"   INTEGER PRIMARY KEY,
-    "name"       VARCHAR(100),
-    "position"   VARCHAR(20)
-);
-"""
+SHOTS_INDEXES = [
+    # Filtro más frecuente en todas las queries del dashboard
+    'CREATE INDEX IF NOT EXISTS idx_shots_season ON shots ("season")',
+    # Queries de equipo (tab Directivos y Entrenador)
+    'CREATE INDEX IF NOT EXISTS idx_shots_teams ON shots ("homeTeamCode", "awayTeamCode")',
+    # Queries de jugador (tab Reclutador — ranking y perfil)
+    'CREATE INDEX IF NOT EXISTS idx_shots_shooter ON shots ("shooterName", "season")',
+    # Filtro de situación de juego (5v5, PP, PK, etc.)
+    'CREATE INDEX IF NOT EXISTS idx_shots_situation ON shots ("gameSituation")',
+    # Filtro clutch (RF-R04)
+    'CREATE INDEX IF NOT EXISTS idx_shots_clutch ON shots ("isClutchSituation")',
+    # Queries de portero (RF-R03)
+    'CREATE INDEX IF NOT EXISTS idx_shots_goalie ON shots ("goalieNameForShot", "season")',
+    # Índice compuesto para queries de equipo + temporada (las más comunes)
+    'CREATE INDEX IF NOT EXISTS idx_shots_season_teams ON shots ("season", "homeTeamCode", "awayTeamCode")',
+]
 
 
 def create_tables(engine) -> None:
     """
-    Crea las tablas en PostgreSQL si todavía no existen.
+    Crea la tabla shots y sus índices en PostgreSQL.
 
-    Usa un context manager (with engine.connect() as conn) para garantizar
-    que la conexión se cierre automáticamente al terminar, incluso si hay
-    un error. Esto evita "connection leaks" (conexiones abiertas sin usar).
+    Teams y players se crean automáticamente via pandas to_sql(if_exists='replace')
+    con todas sus columnas reales — no necesitan DDL manual.
 
-    text() convierte el string SQL en un objeto que SQLAlchemy puede ejecutar.
-    conn.commit() confirma la transacción — sin esto, PostgreSQL no guarda
-    los cambios (DDL en Postgres requiere commit explícito en SQLAlchemy 2.x).
+    Los índices se crean con IF NOT EXISTS, por lo que son idempotentes:
+    se pueden ejecutar múltiples veces sin error.
     """
-    logger.info("Creando tablas si no existen...")
+    logger.info("Creando tabla shots e índices...")
     with engine.connect() as conn:
         conn.execute(text(SHOTS_DDL))
-        conn.execute(text(TEAMS_DDL))
-        conn.execute(text(PLAYERS_DDL))
         conn.commit()
-    logger.info("Tablas verificadas ✓")
+    logger.info("Tabla shots verificada ✓")
+
+
+def create_indexes(engine) -> None:
+    """
+    Crea los índices de la tabla shots.
+    Se llama DESPUÉS de load_shots_streaming porque los índices sobre una
+    tabla vacía son inútiles y ralentizan el COPY. Crearlos al final es
+    más rápido que mantenerlos durante la carga masiva.
+    """
+    logger.info("Creando índices en tabla shots...")
+    with engine.connect() as conn:
+        for idx_sql in SHOTS_INDEXES:
+            name = idx_sql.split("idx_")[1].split(" ")[0]
+            logger.info(f"  → idx_{name}")
+            conn.execute(text(idx_sql))
+        conn.commit()
+    logger.info(f"Índices creados: {len(SHOTS_INDEXES)} ✓")
 
 
 # ── Método de carga COPY ─────────────────────────────────────────────────────
@@ -217,24 +233,43 @@ def _copy_method(table, conn, keys, data_iter):
     Este método se pasa como parámetro `method` a pandas to_sql().
     pandas lo llama automáticamente por cada lote de filas.
     """
+    import math
     from io import StringIO
+
+    def _fmt(v) -> str:
+        """
+        Convierte un valor Python al formato que espera el protocolo COPY de PostgreSQL.
+        - None, float NaN, pd.NA  → \\N  (NULL)
+        - float sin decimales (8474564.0) → "8474564"  (evita error en columnas INTEGER)
+        - resto → str(v)
+        """
+        if v is None:
+            return "\\N"
+        try:
+            import pandas as _pd
+            if v is _pd.NA:
+                return "\\N"
+        except Exception:
+            pass
+        if isinstance(v, float):
+            if math.isnan(v):
+                return "\\N"
+            if v == int(v):          # entero representado como float (ej: 8474564.0)
+                return str(int(v))
+        return str(v)
 
     # Acceder a la conexión psycopg2 subyacente
     dbapi_conn = conn.connection
 
     with dbapi_conn.cursor() as cur:
         buf = StringIO()
-        # Serializar filas: None → \N (NULL en COPY), resto → string con tab como separador
         buf.write(
             "\n".join(
-                "\t".join(
-                    "\\N" if v is None else str(v)
-                    for v in row
-                )
+                "\t".join(_fmt(v) for v in row)
                 for row in data_iter
             )
         )
-        buf.seek(0)  # Volver al inicio del buffer para que COPY lo lea desde el principio
+        buf.seek(0)
         cur.copy_from(buf, table.name, sep="\t", null="\\N", columns=keys)
 
 
@@ -278,20 +313,70 @@ def _load_table(
     logger.info(f"  → '{table_name}' cargada ✓")
 
 
+def load_shots_streaming(engine, src_hist=None, src_2022=None, chunksize: int = CHUNK_SIZE) -> None:
+    """
+    Carga la tabla de tiros leyendo los CSV **en chunks** para evitar OOM.
+
+    En vez de cargar los ~1.6M filas a RAM de golpe, lee, transforma
+    y carga bloques de `chunksize` filas secuencialmente, manteniendo
+    el uso de memoria acotado (~200-400 MB en vez de varios GB).
+
+    Flujo:
+      1. TRUNCATE de la tabla shots
+      2. Para cada chunk de shots_2007-2021.csv → transform → COPY a Postgres
+      3. Para cada chunk de shots_2022.csv      → transform → COPY a Postgres
+
+    Parámetros
+    ----------
+    engine    : Engine de SQLAlchemy conectado a la DB
+    src_hist  : ruta al CSV histórico (str/Path) o None para usar data/raw/
+    src_2022  : ruta al CSV 2022 (str/Path) o None para usar data/raw/
+    chunksize : filas por chunk (default: CHUNK_SIZE = 20.000)
+    """
+    import os as _os
+    from pipeline.extract import RAW_DATA_DIR, FILES, SHOTS_DTYPES
+    from pipeline.transform import transform_shots_chunk
+
+    if src_hist is None:
+        src_hist = _os.path.join(RAW_DATA_DIR, FILES["shots_historical"])
+    if src_2022 is None:
+        src_2022 = _os.path.join(RAW_DATA_DIR, FILES["shots_2022"])
+
+    logger.info("Truncando tabla shots para recarga completa...")
+    with engine.connect() as conn:
+        conn.execute(text("TRUNCATE TABLE shots"))
+        conn.commit()
+
+    total_rows = 0
+    for label, src in [("shots_historical", src_hist), ("shots_2022", src_2022)]:
+        logger.info(f"Cargando {label} en chunks de {chunksize:,}...")
+        chunk_num = 0
+        for chunk in pd.read_csv(src, dtype=SHOTS_DTYPES, low_memory=False, chunksize=chunksize):
+            chunk_num += 1
+            transformed = transform_shots_chunk(chunk)
+            del chunk
+            if transformed.empty:
+                continue
+            transformed.to_sql(
+                name="shots",
+                con=engine,
+                if_exists="append",
+                index=False,
+                chunksize=chunksize,
+                method=_copy_method,
+            )
+            total_rows += len(transformed)
+            del transformed
+            logger.info(f"  → Chunk {chunk_num} | acumulado: {total_rows:,} filas")
+
+    logger.info(f"Shots cargados: {total_rows:,} filas totales ✓")
+
+
 def load_shots(df_shots: pd.DataFrame, engine) -> None:
     """
     Carga la tabla de tiros en PostgreSQL en lotes de CHUNK_SIZE filas.
-
-    ¿Por qué en lotes?
-      El dataset de tiros tiene ~1.7 millones de filas. Si intentamos
-      insertar todo de una vez, Python construiría una única sentencia SQL
-      gigante que podría:
-        - Agotar la memoria RAM disponible
-        - Superar el límite de tamaño de paquete de red del servidor
-        - Hacer que la conexión se corte por timeout
-
-      Al dividir en lotes de 50.000 filas, cada INSERT es manejable y
-      podemos ver el progreso en los logs.
+    (Interfaz original — usa load_shots_streaming internamente si el DataFrame
+    se pasa directamente. Para archivos grandes, preferir load_shots_streaming.)
 
     Parámetros
     ----------
@@ -338,45 +423,37 @@ def load_all(data: dict) -> None:
     Ejecuta la carga completa del pipeline: conecta a Postgres, crea las
     tablas y carga los tres DataFrames.
 
-    Esta es la función que llama el orquestador del pipeline (o el dashboard).
-
     Parámetros
     ----------
     data : dict con claves 'shots', 'teams', 'players'
            (output de transform.transform_all())
+           La clave 'shots' puede ser un DataFrame O None; si es None se
+           usa load_shots_streaming con los archivos en data/raw/.
 
     El flujo es:
-      1. get_engine()     → abre la configuración de conexión
-      2. create_tables()  → crea las tablas si no existen (idempotente)
-      3. load_shots()     → carga ~1.7M filas en lotes
-      4. load_teams()     → carga equipos
-      5. load_players()   → carga jugadores
-
-    Si cualquier paso falla, SQLAlchemyError captura el error y lo loggea
-    con detalle para facilitar el debugging.
+      1. get_engine()            → abre la configuración de conexión
+      2. create_tables()         → crea las tablas si no existen (idempotente)
+      3. load_shots_streaming()  → carga ~1.7M filas chunk a chunk (sin OOM)
+      4. load_teams()            → carga equipos
+      5. load_players()          → carga jugadores
     """
     logger.info("=== Iniciando carga en PostgreSQL ===")
 
     try:
-        # Paso 1: Crear el motor de conexión
         engine = get_engine()
-
-        # Paso 2: Crear tablas si no existen
         create_tables(engine)
 
-        # Paso 3-5: Cargar cada tabla
-        load_shots(data["shots"], engine)
+        load_shots_streaming(engine)
+        create_indexes(engine)   # después de la carga — más rápido que durante el COPY
+
         load_teams(data["teams"], engine)
         load_players(data["players"], engine)
 
         logger.info("=== Carga completa ✓ ===")
 
     except SQLAlchemyError as e:
-        # SQLAlchemyError es la clase base de todos los errores de SQLAlchemy.
-        # Capturarla acá nos permite dar un mensaje claro y no crashear el
-        # pipeline completo si hay un problema de conexión o de datos.
         logger.error(f"Error durante la carga en PostgreSQL: {e}")
-        raise  # Re-lanzamos para que el llamador sepa que algo falló
+        raise
 
 
 # ── Ejecución directa (para pruebas) ──────────────────────────────────────────

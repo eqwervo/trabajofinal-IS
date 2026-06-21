@@ -140,9 +140,45 @@ def _derive_clutch_situation(df: pd.DataFrame) -> pd.Series:
 
 # ── Transformaciones por tabla ────────────────────────────────────────────────
 
+def transform_shots_chunk(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Transforma un único chunk (parcial) del dataset de tiros.
+    Aplica las mismas reglas que transform_shots pero sobre un DataFrame ya
+    cargado en memoria (un solo archivo o porción de él).
+
+    Pasos:
+      1. Seleccionar columnas relevantes (de 124 → ~37)
+      2. Filtrar time == 999
+      3. Descartar nulos en columnas críticas
+      4. Eliminar duplicados intra-chunk por shotID + game_id
+      5. Agregar columnas derivadas
+    """
+    # 1. Seleccionar columnas relevantes
+    keep = [c for c in SHOTS_COLS_KEEP if c in df.columns]
+    df = df[keep].copy()
+
+    # 2. Filtrar time == 999
+    df = df[df["time"] != 999]
+
+    # 3. Descartar nulos en columnas críticas
+    existing_critical = [c for c in CRITICAL_COLS if c in df.columns]
+    df = df.dropna(subset=existing_critical)
+
+    # 4. Dedup intra-chunk
+    df = df.drop_duplicates(subset=["shotID", "game_id"])
+
+    # 5. Columnas derivadas
+    df["gameSituation"]     = _derive_game_situation(df)
+    df["dangerZone"]        = _derive_danger_zone(df)
+    df["isClutchSituation"] = _derive_clutch_situation(df)
+
+    return df
+
+
 def transform_shots(df_hist: pd.DataFrame, df_2022: pd.DataFrame) -> pd.DataFrame:
     """
     Combina y limpia los datasets de tiros (histórico + 2022).
+    Mantiene la interfaz original para compatibilidad con ejecución directa.
 
     Pasos:
       1. Concatenar ambos DataFrames
@@ -154,20 +190,26 @@ def transform_shots(df_hist: pd.DataFrame, df_2022: pd.DataFrame) -> pd.DataFram
     """
     logger.info("Transformando shots...")
 
-    # 1. Concatenar
+    # 1. Seleccionar columnas relevantes en cada DataFrame ANTES de concatenar
+    # para reducir el uso de memoria (de 124 → ~37 columnas por archivo)
+    for df_part in [df_hist, df_2022]:
+        existing = [c for c in SHOTS_COLS_KEEP if c in df_part.columns]
+        df_part.drop(columns=[c for c in df_part.columns if c not in existing], inplace=True)
+
     df = pd.concat([df_hist, df_2022], ignore_index=True)
+    del df_hist, df_2022  # liberar memoria antes de seguir
     logger.info(f"  → Tras concat: {len(df):,} filas")
 
-    # 2. Eliminar duplicados por shotID
+    # 2. Eliminar duplicados por shotID + game_id
     before = len(df)
-    df = df.drop_duplicates(subset="shotID")
+    df = df.drop_duplicates(subset=["shotID", "game_id"])
     dropped = before - len(df)
     if dropped:
-        logger.warning(f"  → {dropped:,} filas duplicadas eliminadas (shotID repetido)")
+        logger.warning(f"  → {dropped:,} filas duplicadas eliminadas (shotID + game_id repetido)")
     else:
         logger.info("  → Sin duplicados detectados ✓")
 
-    # 3. Filtrar time == 999 (variable temporal errónea — documentado por MoneyPuck)
+    # 3. Filtrar time == 999
     before = len(df)
     df = df[df["time"] != 999]
     dropped = before - len(df)
@@ -182,12 +224,10 @@ def transform_shots(df_hist: pd.DataFrame, df_2022: pd.DataFrame) -> pd.DataFram
     if dropped:
         logger.info(f"  → {dropped:,} filas con nulos en columnas críticas descartadas")
 
-    # 5. Seleccionar columnas (ignorar las que no estén en el CSV)
-    existing_cols = [c for c in SHOTS_COLS_KEEP if c in df.columns]
-    missing = set(SHOTS_COLS_KEEP) - set(existing_cols)
+    # 5. Verificar columnas faltantes
+    missing = set(SHOTS_COLS_KEEP) - set(df.columns)
     if missing:
         logger.warning(f"  → Columnas no encontradas en el CSV: {sorted(missing)}")
-    df = df[existing_cols].copy()
 
     # 6. Columnas derivadas
     df["gameSituation"]    = _derive_game_situation(df)
