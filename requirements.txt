@@ -4,3 +4,4 @@ streamlit
 sqlalchemy
 python-dotenv
 plotly
+bcrypt

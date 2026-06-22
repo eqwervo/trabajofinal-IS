@@ -1,4 +1,5 @@
 import os
+import sys
 import base64
 import streamlit as st
 import pandas as pd
@@ -351,6 +352,17 @@ hr {
     gap: 20px;
     margin-top: 32px;
 }
+
+/* Auth — centrar radio y fuente Orbitron */
+div[data-testid="stRadio"] > div { justify-content: center !important; gap: 28px !important; }
+div[data-testid="stRadio"] label span p {
+    font-family: 'Orbitron', monospace !important;
+    font-size: 0.65rem !important;
+    letter-spacing: 3px !important;
+}
+
+/* Auth — botón Salir compacto */
+button[kind="secondary"] { font-size: 0.68rem !important; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -402,6 +414,71 @@ def run_query(_engine, sql, params=None):
     return df
 
 engine = get_engine()
+
+# ── Auth ──────────────────────────────────────────────────────────────────────
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from auth import create_users_table, register_user, login_user, ROLES
+create_users_table(engine)
+
+def _show_auth_screen(_eng):
+    _lt = (f'<img src="data:image/png;base64,{_LOGO}" '
+           f'style="height:80px;width:auto;'
+           f'filter:drop-shadow(0 0 18px rgba(79,195,247,0.55));">') if _LOGO else ""
+    st.markdown(f"""
+<div class="banner">
+  <div style="display:flex;align-items:center;justify-content:center;gap:24px;position:relative;z-index:1;">
+    {_lt}
+    <div class="banner-title">IceStats</div>
+  </div>
+</div>
+""", unsafe_allow_html=True)
+
+    _role_desc = {
+        "directivo":  "Directivo — estrategia y rendimiento de franquicia",
+        "entrenador": "Entrenador — análisis táctico y mapas de tiro",
+        "reclutador": "Reclutador — perfiles de jugadores y porteros",
+    }
+    _, _col, _ = st.columns([1, 1.4, 1])
+    with _col:
+        st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
+        _mode = st.radio("", ["ACCEDER", "REGISTRARSE"], horizontal=True,
+                         label_visibility="collapsed", key="auth_mode")
+        st.divider()
+
+        if _mode == "ACCEDER":
+            with st.form("form_login"):
+                _u = st.text_input("Usuario")
+                _p = st.text_input("Contraseña", type="password")
+                if st.form_submit_button("INGRESAR", use_container_width=True, type="primary"):
+                    if _u and _p:
+                        _res = login_user(_eng, _u, _p)
+                        if _res:
+                            st.session_state["user"] = _res
+                            st.rerun()
+                        else:
+                            st.error("Usuario o contraseña incorrectos.")
+                    else:
+                        st.warning("Completá todos los campos.")
+        else:
+            with st.form("form_register"):
+                _u  = st.text_input("Usuario")
+                _fn = st.text_input("Nombre completo")
+                _rl = st.selectbox("Rol", list(ROLES.keys()),
+                                   format_func=lambda r: _role_desc[r])
+                _p  = st.text_input("Contraseña", type="password",
+                                    placeholder="mínimo 6 caracteres")
+                _p2 = st.text_input("Confirmar contraseña", type="password")
+                if st.form_submit_button("CREAR CUENTA", use_container_width=True, type="primary"):
+                    if not all([_u, _fn, _p, _p2]):
+                        st.warning("Completá todos los campos.")
+                    elif _p != _p2:
+                        st.error("Las contraseñas no coinciden.")
+                    else:
+                        _ok, _msg = register_user(_eng, _u, _fn, _p, _rl)
+                        if _ok:
+                            st.success("✓ Cuenta creada. Ahora podés iniciar sesión.")
+                        else:
+                            st.error(_msg)
 
 if "pipeline_checked" not in st.session_state:
     try:
@@ -482,6 +559,11 @@ if "pipeline_checked" not in st.session_state:
             else:
                 st.caption("Subí los 4 archivos para habilitar la carga.")
             st.stop()
+
+# ── Verificar sesión activa ───────────────────────────────────────────────────
+if "user" not in st.session_state:
+    _show_auth_screen(engine)
+    st.stop()
 
 @st.cache_data(ttl=3600)
 def load_globals(_engine):
@@ -607,12 +689,26 @@ st.markdown(f"""
 </div>
 """, unsafe_allow_html=True)
 
-tab_dir, tab_ent, tab_rec = st.tabs(["DIRECTIVOS", "ENTRENADOR", "RECLUTADOR"])
+_u = st.session_state["user"]
+_col_inf, _col_out = st.columns([9, 1])
+with _col_inf:
+    st.markdown(
+        f'<p style="font-family:\'Exo 2\',sans-serif;font-size:0.72rem;'
+        f'letter-spacing:2px;color:rgba(79,195,247,0.6);text-transform:uppercase;margin:0 0 10px 4px;">'
+        f'{_u["name"]} &nbsp;·&nbsp; {ROLES[_u["role"]]}</p>',
+        unsafe_allow_html=True,
+    )
+with _col_out:
+    if st.button("Salir", key="logout_btn", use_container_width=True):
+        del st.session_state["user"]
+        st.rerun()
+
+_role = _u["role"]
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # TAB 1 — DIRECTIVOS
 # ═══════════════════════════════════════════════════════════════════════════════
-with tab_dir:
+if _role == "directivo":
     sh("Filtros de análisis")
     col1, col2, col3, col4 = st.columns([1, 2, 1, 1])
     with col1:
@@ -784,7 +880,7 @@ with tab_dir:
 # ═══════════════════════════════════════════════════════════════════════════════
 # TAB 2 — ENTRENADOR
 # ═══════════════════════════════════════════════════════════════════════════════
-with tab_ent:
+elif _role == "entrenador":
     sh("Parámetros tácticos")
     col1, col2, col3, col4 = st.columns(4)
     with col1:
@@ -881,7 +977,7 @@ with tab_ent:
 # ═══════════════════════════════════════════════════════════════════════════════
 # TAB 3 — RECLUTADOR
 # ═══════════════════════════════════════════════════════════════════════════════
-with tab_rec:
+elif _role == "reclutador":
     sh("Parámetros de búsqueda")
     col1, col2, col3 = st.columns([1,1,2])
     with col1: season_r = int(st.selectbox("Temporada", seasons[::-1], key="season_r"))
