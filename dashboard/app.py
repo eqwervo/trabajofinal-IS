@@ -987,7 +987,7 @@ elif _role == "reclutador":
     pos_cond = "" if position_r=="Todas" else f'AND "playerPositionThatDidEvent"=\'{position_r}\''
 
     st.divider()
-    sh("Ranking ofensivo — Top jugadores")
+    sh("RF-R02 — Ranking ofensivo por eficiencia")
     with st.spinner("Calculando métricas avanzadas..."):
         df_rank = run_query(engine, f"""
             SELECT s."shooterName" AS jugador, s."playerPositionThatDidEvent" AS pos,
@@ -995,6 +995,8 @@ elif _role == "reclutador":
                    ROUND(SUM(s."xGoal")::numeric,2) AS xgoal,
                    ROUND(SUM(s."goal")::numeric/NULLIF(COUNT(*),0)*100,1) AS conv_pct,
                    ROUND((SUM(s."goal")-SUM(s."xGoal"))::numeric,2) AS goe,
+                   ROUND(AVG(s."arenaAdjustedShotDistance")::numeric,1) AS dist_prom,
+                   MODE() WITHIN GROUP (ORDER BY s."shotType") AS tipo_preferido,
                    MAX(p.nationality) AS nacionalidad,
                    MAX(p."birthDate") AS birth_date,
                    MAX(p.weight) AS peso,
@@ -1006,29 +1008,21 @@ elif _role == "reclutador":
             ORDER BY xgoal DESC LIMIT 30
         """, {"season": season_r, "ms": min_shots})
 
-    # Calcular edad a partir del año de nacimiento y la temporada seleccionada
     df_rank["edad"] = df_rank["birth_date"].apply(
         lambda d: season_r - int(str(d)[:4]) if pd.notna(d) and str(d) not in ("nan", "None", "") else None
     )
 
-    # Construir tabla de display con columnas renombradas y "No Data" en celdas vacías
-    df_display = df_rank[["jugador","pos","nacionalidad","edad","peso","altura",
-                           "disparos","goles","xgoal","conv_pct","goe"]].copy()
+    df_display = df_rank[["jugador","pos","disparos","goles","xgoal","conv_pct","goe"]].copy()
     df_display = df_display.rename(columns={
-        "jugador":    "Jugador",
-        "pos":        "Pos",
-        "nacionalidad":"Nac.",
-        "edad":       "Edad",
-        "peso":       "Peso (lb)",
-        "altura":     "Altura",
-        "disparos":   "Disparos",
-        "goles":      "Goles",
-        "xgoal":      "xGoal",
-        "conv_pct":   "Conv%",
-        "goe":        "GOE",
+        "jugador":  "Jugador",
+        "pos":      "Pos",
+        "disparos": "Disparos",
+        "goles":    "Goles",
+        "xgoal":    "xGoal",
+        "conv_pct": "Conv%",
+        "goe":      "GOE",
     })
     df_display = df_display.fillna("No Data")
-
     st.dataframe(df_display, use_container_width=True, hide_index=True)
 
     fig_rank = go.Figure(go.Bar(
@@ -1042,99 +1036,98 @@ elif _role == "reclutador":
     fig_rank.update_layout(xaxis_tickangle=45)
     st.plotly_chart(fig_rank, use_container_width=True)
 
+    # ── Perfil individual (RF-R01) ────────────────────────────────────────────
+    st.divider()
+    sh("RF-R01 — Perfil individual de jugador")
+    jugadores_lista = df_rank["jugador"].tolist()
+    jugador_sel = st.selectbox("Seleccioná un jugador", jugadores_lista, key="jugador_sel_r01")
+
+    if jugador_sel:
+        row = df_rank[df_rank["jugador"] == jugador_sel].iloc[0]
+
+        # Bio
+        bio1, bio2, bio3, bio4 = st.columns(4)
+        bio1.metric("Nacionalidad", str(row['nacionalidad']) if pd.notna(row['nacionalidad']) else "N/A")
+        bio2.metric("Edad",         f"{int(row['edad'])}" if pd.notna(row['edad']) else "N/A")
+        bio3.metric("Peso",         f"{int(row['peso'])} lb" if pd.notna(row['peso']) else "N/A")
+        bio4.metric("Altura",       str(row['altura']) if pd.notna(row['altura']) else "N/A")
+
+        st.markdown("<div style='margin-top:8px'></div>", unsafe_allow_html=True)
+
+        # Métricas ofensivas
+        m1, m2, m3, m4, m5, m6 = st.columns(6)
+        m1.metric("Disparos",       f"{int(row['disparos']):,}")
+        m2.metric("Goles",          f"{int(row['goles'])}")
+        m3.metric("xGoal",          f"{float(row['xgoal']):.2f}")
+        m4.metric("Conv%",          f"{float(row['conv_pct']) if pd.notna(row['conv_pct']) else 0:.1f}%")
+        m5.metric("Dist. prom",     f"{float(row['dist_prom']) if pd.notna(row['dist_prom']) else 0:.1f} ft")
+        m6.metric("Tipo preferido", str(row['tipo_preferido']) if pd.notna(row['tipo_preferido']) else "N/A")
+
+        # Gráficos: xGoal vs Goles reales + distribución de disparos por temporada
+        p1, p2 = st.columns(2)
+        with p1:
+            fig_perf = go.Figure()
+            fig_perf.add_trace(go.Bar(name="xGoal", x=["xGoal"], y=[float(row['xgoal'])],
+                                      marker_color=C_CYAN))
+            fig_perf.add_trace(go.Bar(name="Goles reales", x=["Goles"], y=[int(row['goles'])],
+                                      marker_color=C_GRN))
+            base_layout(fig_perf, "xGoal vs Goles reales")
+            fig_perf.update_layout(barmode="group")
+            st.plotly_chart(fig_perf, use_container_width=True)
+        with p2:
+            df_hist_j = run_query(engine, """
+                SELECT season, COUNT(*) AS disparos, SUM(goal) AS goles,
+                       ROUND(SUM("xGoal")::numeric,2) AS xgoal
+                FROM shots WHERE "shooterName"=:j GROUP BY season ORDER BY season
+            """, {"j": jugador_sel})
+            if not df_hist_j.empty:
+                fig_hist_j = go.Figure()
+                fig_hist_j.add_trace(go.Scatter(x=df_hist_j["season"], y=df_hist_j["disparos"],
+                                                mode="lines+markers", name="Disparos", line=dict(color=C_CYAN)))
+                fig_hist_j.add_trace(go.Scatter(x=df_hist_j["season"], y=df_hist_j["xgoal"],
+                                                mode="lines+markers", name="xGoal", line=dict(color=C_PURP)))
+                base_layout(fig_hist_j, "Evolución por temporada")
+                st.plotly_chart(fig_hist_j, use_container_width=True)
+
     st.divider()
     col_c1, col_c2 = st.columns(2)
 
     with col_c1:
-        sh("Jugadores Clutch — Alta presión")
+        sh("RF-R04 — Clutch: Presión vs Normal")
         df_clutch = run_query(engine, f"""
-            SELECT "shooterName" AS jugador, COUNT(*) AS tiros,
-                   SUM("goal") AS goles, ROUND(SUM("xGoal")::numeric,2) AS xgoal,
-                   ROUND(SUM("goal")::numeric/NULLIF(COUNT(*),0)*100,1) AS conv
+            SELECT "shooterName" AS jugador,
+                   ROUND(SUM(CASE WHEN "isClutchSituation"=TRUE  THEN "goal" ELSE 0 END)::numeric
+                        /NULLIF(SUM(CASE WHEN "isClutchSituation"=TRUE  THEN 1 ELSE 0 END),0)*100,1) AS conv_clutch,
+                   ROUND(SUM(CASE WHEN "isClutchSituation"=FALSE THEN "goal" ELSE 0 END)::numeric
+                        /NULLIF(SUM(CASE WHEN "isClutchSituation"=FALSE THEN 1 ELSE 0 END),0)*100,1) AS conv_normal,
+                   SUM(CASE WHEN "isClutchSituation"=TRUE THEN 1 ELSE 0 END) AS tiros_clutch
             FROM shots
-            WHERE season=:season AND "isClutchSituation"=TRUE
-              AND "shooterName" IS NOT NULL {pos_cond}
-            GROUP BY 1 HAVING COUNT(*)>=:ms
-            ORDER BY goles DESC LIMIT 15
+            WHERE season=:season AND "shooterName" IS NOT NULL {pos_cond}
+            GROUP BY 1
+            HAVING SUM(CASE WHEN "isClutchSituation"=TRUE THEN 1 ELSE 0 END) >= :ms
+            ORDER BY conv_clutch DESC LIMIT 15
         """, {"season": season_r, "ms": max(min_shots//4,5)})
 
-        fig_clutch = go.Figure(go.Bar(
-            x=df_clutch["jugador"], y=df_clutch["goles"],
-            marker=dict(color=df_clutch["conv"],
-                        colorscale=[[0,C_ORG],[1,C_RED]],
-                        line=dict(color="rgba(239,83,80,0.2)",width=0.5)),
-            hovertemplate="<b>%{x}</b><br>Goles clutch: %{y}<extra></extra>",
+        fig_clutch = go.Figure()
+        fig_clutch.add_trace(go.Bar(
+            name="Conv% clutch", x=df_clutch["jugador"], y=df_clutch["conv_clutch"],
+            marker=dict(color=C_RED),
+            hovertemplate="<b>%{x}</b><br>Conv% clutch: %{y:.1f}%<extra></extra>",
         ))
-        base_layout(fig_clutch, "Goles en situaciones de alta presión")
-        fig_clutch.update_layout(xaxis_tickangle=45)
+        fig_clutch.add_trace(go.Bar(
+            name="Conv% normal", x=df_clutch["jugador"], y=df_clutch["conv_normal"],
+            marker=dict(color=C_CYAN),
+            hovertemplate="<b>%{x}</b><br>Conv% normal: %{y:.1f}%<extra></extra>",
+        ))
+        base_layout(fig_clutch, "Conversión bajo presión vs rendimiento habitual")
+        fig_clutch.update_layout(barmode="group", xaxis_tickangle=45)
         st.plotly_chart(fig_clutch, use_container_width=True)
 
     with col_c2:
-        sh("Porteros — Goals Saved Above Expected")
+        sh("RF-R03 — Porteros: Goals Saved Above Expected")
         df_goalies = run_query(engine, f"""
             SELECT "goalieNameForShot" AS portero, COUNT(*) AS disparos,
                    SUM("goal") AS concedidos,
                    ROUND(SUM("xGoal")::numeric,2) AS xgoal_esp,
                    ROUND((SUM("xGoal")-SUM("goal"))::numeric,2) AS gsae,
-                   ROUND((1-SUM("goal")::numeric/NULLIF(COUNT(*),0))*100,1) AS sv_pct
-            FROM shots
-            WHERE season=:season AND "goalieNameForShot" IS NOT NULL
-            GROUP BY 1 HAVING COUNT(*)>=100
-            ORDER BY gsae DESC LIMIT 15
-        """, {"season": season_r})
-
-        fig_goalie = go.Figure(go.Bar(
-            x=df_goalies["portero"], y=df_goalies["gsae"],
-            marker=dict(color=df_goalies["sv_pct"],
-                        colorscale=[[0,C_CYAN],[1,C_GRN]],
-                        line=dict(color="rgba(102,187,106,0.2)",width=0.5)),
-            hovertemplate="<b>%{x}</b><br>GSAE: %{y:.2f}<extra></extra>",
-        ))
-        base_layout(fig_goalie, "Goals Saved Above Expected")
-        fig_goalie.update_layout(xaxis_tickangle=45)
-        st.plotly_chart(fig_goalie, use_container_width=True)
-
-# ── Actualizar dataset ───────────────────────────────────────────────────────
-with st.expander("Actualizar shots", expanded=False):
-    st.markdown("<p style='text-align:center;font-family:Orbitron,monospace;font-size:0.75rem;letter-spacing:3px;text-transform:uppercase;color:#4fc3f7;margin-bottom:6px;'>Reemplazar archivos de tiros</p>", unsafe_allow_html=True)
-    st.markdown("<p style='text-align:center;font-family:Exo 2,sans-serif;font-size:0.78rem;color:rgba(79,195,247,0.55);margin-bottom:16px;'>Subí los archivos de shots para actualizar los datos. Equipos y jugadores se mantienen.</p>", unsafe_allow_html=True)
-    uc1, uc2 = st.columns(2)
-    with uc1:
-        up_hist = st.file_uploader("shots_2007-2021.csv", type="csv", key="up_hist")
-    with uc2:
-        up_2022 = st.file_uploader("shots_2022.csv", type="csv", key="up_2022")
-
-    all_uploaded = all([up_hist, up_2022])
-    if st.button("Procesar y actualizar", disabled=not all_uploaded, key="btn_update"):
-        try:
-            import sys as _sys2, os as _os2
-            _sys2.path.insert(0, "/app")
-            from pipeline.extract import FILES as _FILES, RAW_DATA_DIR as _RAW
-            from pipeline.load import load_shots_streaming as _load_shots, get_engine as _get_eng, create_tables as _create_tables
-            with st.spinner("Guardando archivos..."):
-                _os2.makedirs(_RAW, exist_ok=True)
-                for _fname, _fobj in [
-                    (_FILES["shots_historical"], up_hist),
-                    (_FILES["shots_2022"],       up_2022),
-                ]:
-                    with open(_os2.path.join(_RAW, _fname), "wb") as _f:
-                        _f.write(_fobj.read())
-            with st.spinner("Procesando shots..."):
-                _eng2 = _get_eng()
-                _create_tables(_eng2)
-                _load_shots(_eng2)
-            st.cache_data.clear()
-            st.session_state.pop("pipeline_checked", None)
-            st.success("Shots actualizados. Recargando...")
-            st.rerun()
-        except Exception as e:
-            st.error(f"Error al actualizar: {e}")
-
-# ── Footer ────────────────────────────────────────────────────────────────────
-st.markdown(f"""
-<div class="db-footer">
-  <div class="db-sync-status"><span class="db-dot"></span>Base sincronizada</div>
-  <div class="db-sync-file">{_db_files}</div>
-  <div class="db-sync-meta">{_db_count_fmt} registros &nbsp;&middot;&nbsp; {_db_date}</div>
-</div>
-""", unsafe_allow_html=True)
+            

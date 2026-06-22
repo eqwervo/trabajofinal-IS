@@ -41,7 +41,7 @@ logger = logging.getLogger(__name__)
 # Con ~1.7M filas, cargar todo de una vez consumiría demasiada memoria.
 # Dividimos la carga en bloques de CHUNK_SIZE filas.
 # Valor elegido como balance entre velocidad y uso de memoria.
-CHUNK_SIZE = 20_000
+CHUNK_SIZE = 100_000
 
 
 # ── Conexión ──────────────────────────────────────────────────────────────────
