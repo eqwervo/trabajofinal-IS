@@ -1154,12 +1154,91 @@ elif _role == "reclutador":
             x=df_goalies["portero"], y=df_goalies["gsae"],
             marker=dict(color=df_goalies["sv_pct"],
                         colorscale=[[0,C_CYAN],[1,C_GRN]],
-                        line=dict(color="rgba(102,187,106,0.2)", width=0.5)),
+                        line=dict(color="rgba(102,187,106,0.2)",width=0.5)),
             hovertemplate="<b>%{x}</b><br>GSAE: %{y:.2f}<extra></extra>",
         ))
         base_layout(fig_goalie, "Goals Saved Above Expected")
         fig_goalie.update_layout(xaxis_tickangle=45)
         st.plotly_chart(fig_goalie, use_container_width=True)
+
+    # ── Métricas defensivas por equipo (RF-R05) ───────────────────────────────
+    st.divider()
+    sh("RF-R05 — Perfil defensivo por equipo — Temporada " + str(season_r))
+    with st.spinner("Cargando métricas defensivas..."):
+        df_def = run_query(engine, """
+            SELECT team,
+                   ROUND(AVG("hitsFor")::numeric,1)                  AS hits,
+                   ROUND(AVG("takeawaysFor")::numeric,1)              AS takeaways,
+                   ROUND(AVG("giveawaysFor")::numeric,1)              AS giveaways,
+                   ROUND(AVG("blockedShotAttemptsFor")::numeric,1)    AS bloqueos,
+                   ROUND(AVG("faceOffsWonFor")::numeric,1)            AS faceoffs
+            FROM teams
+            WHERE season=:season AND situation='5on5'
+            GROUP BY team ORDER BY hits DESC
+        """, {"season": season_r})
+
+    if not df_def.empty:
+        for col in ["hits","takeaways","giveaways","bloqueos","faceoffs"]:
+            df_def[col] = pd.to_numeric(df_def[col], errors="coerce").fillna(0)
+        df_def["indice_def"] = (
+            df_def["hits"] + df_def["takeaways"] + df_def["bloqueos"] - df_def["giveaways"]
+        ).round(1)
+        df_def = df_def.sort_values("indice_def", ascending=False)
+
+        fig_def = go.Figure(go.Bar(
+            x=df_def["team"], y=df_def["indice_def"],
+            marker=dict(color=df_def["indice_def"],
+                        colorscale=[[0,C_CYAN],[0.5,C_PURP],[1,C_GRN]],
+                        line=dict(color="rgba(102,187,106,0.15)",width=0.5)),
+            hovertemplate="<b>%{x}</b><br>Índice defensivo: %{y:.1f}<extra></extra>",
+        ))
+        base_layout(fig_def, "Índice defensivo compuesto (hits + takeaways + bloqueos − giveaways)")
+        fig_def.update_layout(xaxis_tickangle=45)
+        st.plotly_chart(fig_def, use_container_width=True)
+
+        df_def_display = df_def[["team","hits","takeaways","bloqueos","giveaways","faceoffs","indice_def"]].rename(columns={
+            "team":"Equipo","hits":"Hits","takeaways":"Takeaways",
+            "bloqueos":"Bloqueos","giveaways":"Giveaways",
+            "faceoffs":"Faceoffs ganados","indice_def":"Índice def."
+        })
+        st.dataframe(df_def_display, use_container_width=True, hide_index=True)
+        st.caption("Datos promedio por partido en situación 5vs5. Índice def. = hits + takeaways + bloqueos − giveaways.")
+
+# ── Actualizar dataset ───────────────────────────────────────────────────────
+with st.expander("Actualizar shots", expanded=False):
+    st.markdown("<p style='text-align:center;font-family:Orbitron,monospace;font-size:0.75rem;letter-spacing:3px;text-transform:uppercase;color:#4fc3f7;margin-bottom:6px;'>Reemplazar archivos de tiros</p>", unsafe_allow_html=True)
+    st.markdown("<p style='text-align:center;font-family:Exo 2,sans-serif;font-size:0.78rem;color:rgba(79,195,247,0.55);margin-bottom:16px;'>Subí los archivos de shots para actualizar los datos. Equipos y jugadores se mantienen.</p>", unsafe_allow_html=True)
+    uc1, uc2 = st.columns(2)
+    with uc1:
+        up_hist = st.file_uploader("shots_2007-2021.csv", type="csv", key="up_hist")
+    with uc2:
+        up_2022 = st.file_uploader("shots_2022.csv", type="csv", key="up_2022")
+
+    all_uploaded = all([up_hist, up_2022])
+    if st.button("Procesar y actualizar", disabled=not all_uploaded, key="btn_update"):
+        try:
+            import sys as _sys2, os as _os2
+            _sys2.path.insert(0, "/app")
+            from pipeline.extract import FILES as _FILES, RAW_DATA_DIR as _RAW
+            from pipeline.load import load_shots_streaming as _load_shots, get_engine as _get_eng, create_tables as _create_tables
+            with st.spinner("Guardando archivos..."):
+                _os2.makedirs(_RAW, exist_ok=True)
+                for _fname, _fobj in [
+                    (_FILES["shots_historical"], up_hist),
+                    (_FILES["shots_2022"],       up_2022),
+                ]:
+                    with open(_os2.path.join(_RAW, _fname), "wb") as _f:
+                        _f.write(_fobj.read())
+            with st.spinner("Procesando shots..."):
+                _eng2 = _get_eng()
+                _create_tables(_eng2)
+                _load_shots(_eng2)
+            st.cache_data.clear()
+            st.session_state.pop("pipeline_checked", None)
+            st.success("Shots actualizados. Recargando...")
+            st.rerun()
+        except Exception as e:
+            st.error(f"Error al actualizar: {e}")
 
 # ── Footer ────────────────────────────────────────────────────────────────────
 st.markdown(f"""
