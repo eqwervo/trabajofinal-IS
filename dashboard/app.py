@@ -484,8 +484,13 @@ if "pipeline_checked" not in st.session_state:
     try:
         with engine.connect() as conn:
             count = conn.execute(text("SELECT COUNT(*) FROM shots")).scalar()
+            conn.execute(text("SELECT 1 FROM players LIMIT 1"))
+            conn.execute(text("SELECT 1 FROM teams LIMIT 1"))
     except Exception:
         count = 0
+
+    if count > 0:
+        st.session_state["pipeline_checked"] = True
 
     if count == 0:
         import sys, os as _os
