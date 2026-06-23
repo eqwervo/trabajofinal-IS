@@ -505,16 +505,19 @@ if "pipeline_checked" not in st.session_state:
                 st.markdown(f'<img src="data:image/png;base64,{_LOGO}" style="width:100%;filter:drop-shadow(0 0 24px rgba(79,195,247,0.5));">', unsafe_allow_html=True)
 
         if files_exist:
-            # Modo local: archivos presentes en data/raw/
-            # Usa streaming para shots (evita OOM con ~1.7M filas)
             st.markdown("<p style='text-align:center;font-family:Orbitron,monospace;color:#4fc3f7;letter-spacing:3px;font-size:0.8rem;margin-top:16px;'>INICIALIZANDO BASE DE DATOS</p>", unsafe_allow_html=True)
-            with st.spinner("Esto puede tardar unos minutos..."):
-                from pipeline.extract import extract_teams, extract_players
-                from pipeline.transform import transform_teams, transform_players
-                from pipeline.load import load_shots_streaming, load_teams, load_players, get_engine as _get_engine, create_tables
-                _eng = _get_engine()
-                create_tables(_eng)
-                load_shots_streaming(_eng)          # lee CSV en chunks, no carga todo a RAM
+            from pipeline.extract import extract_teams, extract_players
+            from pipeline.transform import transform_teams, transform_players
+            from pipeline.load import load_shots_streaming, load_teams, load_players, get_engine as _get_engine, create_tables
+            _eng = _get_engine()
+            create_tables(_eng)
+            _TOTAL_CHUNKS = 18  # ~16 de histórico + ~2 de 2022
+            _prog = st.progress(0, text="Cargando tiros... 0 filas")
+            def _cb(n, rows):
+                _prog.progress(min(n / _TOTAL_CHUNKS, 1.0), text=f"Cargando tiros... {rows:,} filas procesadas")
+            load_shots_streaming(_eng, on_chunk=_cb)
+            _prog.progress(1.0, text="✓ Tiros cargados")
+            with st.spinner("Cargando equipos y jugadores..."):
                 load_teams(transform_teams(extract_teams()), _eng)
                 load_players(transform_players(extract_players()), _eng)
             st.session_state["pipeline_checked"] = True
@@ -545,13 +548,18 @@ if "pipeline_checked" not in st.session_state:
                         ]:
                             with open(_os.path.join(RAW_DATA_DIR, _fname), "wb") as _f:
                                 _f.write(_fobj.read())
-                    with st.spinner("Procesando y cargando base de datos..."):
-                        from pipeline.extract import extract_teams, extract_players
-                        from pipeline.transform import transform_teams, transform_players
-                        from pipeline.load import load_shots_streaming, load_teams, load_players, get_engine as _get_engine, create_tables
-                        _eng = _get_engine()
-                        create_tables(_eng)
-                        load_shots_streaming(_eng)
+                    from pipeline.extract import extract_teams, extract_players
+                    from pipeline.transform import transform_teams, transform_players
+                    from pipeline.load import load_shots_streaming, load_teams, load_players, get_engine as _get_engine, create_tables
+                    _eng = _get_engine()
+                    create_tables(_eng)
+                    _TOTAL_CHUNKS_UP = 18
+                    _prog_up = st.progress(0, text="Cargando tiros... 0 filas")
+                    def _cb_up(n, rows):
+                        _prog_up.progress(min(n / _TOTAL_CHUNKS_UP, 1.0), text=f"Cargando tiros... {rows:,} filas procesadas")
+                    load_shots_streaming(_eng, on_chunk=_cb_up)
+                    _prog_up.progress(1.0, text="✓ Tiros cargados")
+                    with st.spinner("Cargando equipos y jugadores..."):
                         load_teams(transform_teams(extract_teams()), _eng)
                         load_players(transform_players(extract_players()), _eng)
                     st.session_state["pipeline_checked"] = True
@@ -1130,4 +1138,29 @@ elif _role == "reclutador":
                    SUM("goal") AS concedidos,
                    ROUND(SUM("xGoal")::numeric,2) AS xgoal_esp,
                    ROUND((SUM("xGoal")-SUM("goal"))::numeric,2) AS gsae,
-            
+                   ROUND((1-SUM("goal")::numeric/NULLIF(COUNT(*),0))*100,1) AS sv_pct
+            FROM shots
+            WHERE season=:season AND "goalieNameForShot" IS NOT NULL
+            GROUP BY 1 HAVING COUNT(*)>=100
+            ORDER BY gsae DESC LIMIT 15
+        """, {"season": season_r})
+
+        fig_goalie = go.Figure(go.Bar(
+            x=df_goalies["portero"], y=df_goalies["gsae"],
+            marker=dict(color=df_goalies["sv_pct"],
+                        colorscale=[[0,C_CYAN],[1,C_GRN]],
+                        line=dict(color="rgba(102,187,106,0.2)", width=0.5)),
+            hovertemplate="<b>%{x}</b><br>GSAE: %{y:.2f}<extra></extra>",
+        ))
+        base_layout(fig_goalie, "Goals Saved Above Expected")
+        fig_goalie.update_layout(xaxis_tickangle=45)
+        st.plotly_chart(fig_goalie, use_container_width=True)
+
+# ── Footer ────────────────────────────────────────────────────────────────────
+st.markdown(f"""
+<div class="db-footer">
+  <div class="db-sync-status"><span class="db-dot"></span>Base sincronizada</div>
+  <div class="db-sync-file">{_db_files}</div>
+  <div class="db-sync-meta">{_db_count_fmt} registros &nbsp;&middot;&nbsp; {_db_date}</div>
+</div>
+""", unsafe_allow_html=True)

@@ -313,7 +313,7 @@ def _load_table(
     logger.info(f"  → '{table_name}' cargada ✓")
 
 
-def load_shots_streaming(engine, src_hist=None, src_2022=None, chunksize: int = CHUNK_SIZE) -> None:
+def load_shots_streaming(engine, src_hist=None, src_2022=None, chunksize: int = CHUNK_SIZE, on_chunk=None) -> None:
     """
     Carga la tabla de tiros leyendo los CSV **en chunks** para evitar OOM.
 
@@ -348,11 +348,11 @@ def load_shots_streaming(engine, src_hist=None, src_2022=None, chunksize: int = 
         conn.commit()
 
     total_rows = 0
+    chunk_num_global = 0
     for label, src in [("shots_historical", src_hist), ("shots_2022", src_2022)]:
         logger.info(f"Cargando {label} en chunks de {chunksize:,}...")
-        chunk_num = 0
         for chunk in pd.read_csv(src, dtype=SHOTS_DTYPES, low_memory=False, chunksize=chunksize):
-            chunk_num += 1
+            chunk_num_global += 1
             transformed = transform_shots_chunk(chunk)
             del chunk
             if transformed.empty:
@@ -367,7 +367,9 @@ def load_shots_streaming(engine, src_hist=None, src_2022=None, chunksize: int = 
             )
             total_rows += len(transformed)
             del transformed
-            logger.info(f"  → Chunk {chunk_num} | acumulado: {total_rows:,} filas")
+            logger.info(f"  → Chunk {chunk_num_global} | acumulado: {total_rows:,} filas")
+            if on_chunk:
+                on_chunk(chunk_num_global, total_rows)
 
     logger.info(f"Shots cargados: {total_rows:,} filas totales ✓")
 
